@@ -1,0 +1,2 @@
+model,best_iteration,test_auc,test_accuracy,test_precision,test_recall,test_f1,threshold,test_rows,test_positive_samples,test_negative_samples
+XGBoost_baseline,196,0.8165631917948519,0.8144318016918336,0.06193269252213475,0.662136385312351,0.11327065445720229,0.5,234302,4194,230108

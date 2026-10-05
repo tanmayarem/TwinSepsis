@@ -1,0 +1,2 @@
+model,best_iteration,validation_auc,validation_accuracy,validation_precision,validation_recall,validation_f1,threshold
+XGBoost_baseline,196,0.7966686542695802,0.8156666897076105,0.0591252576139226,0.620374819798174,0.10796119752466968,0.5
