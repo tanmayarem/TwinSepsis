@@ -1,0 +1,2 @@
+model,n_estimators,threshold,test_auc,test_accuracy,test_precision,test_recall,test_f1,test_rows,test_positive_samples,test_negative_samples
+RandomForest_baseline,300,0.17,0.781508441343199,0.9298682896432809,0.09081182292363248,0.32379589890319505,0.14184249007729266,234302,4194,230108
