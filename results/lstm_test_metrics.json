@@ -1,0 +1,20 @@
+{
+    "model": "LSTM",
+    "epochs": 5,
+    "input_features": 40,
+    "hidden_size": 64,
+    "test_patients": 6051,
+    "test_hourly_records": 234302,
+    "threshold": 0.5,
+    "roc_auc": 0.7937668980489674,
+    "accuracy": 0.907316198752038,
+    "precision": 0.0939846139586616,
+    "recall": 0.48354792560801146,
+    "f1_score": 0.15738010243675307,
+    "true_positives": 2028,
+    "false_positives": 19550,
+    "true_negatives": 210558,
+    "false_negatives": 2166,
+    "false_alarm_rate": 0.08496010568950232,
+    "best_validation_auc": 0.7825
+}

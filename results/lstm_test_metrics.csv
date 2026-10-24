@@ -1,0 +1,2 @@
+model,epochs,input_features,hidden_size,test_patients,test_hourly_records,threshold,roc_auc,accuracy,precision,recall,f1_score,true_positives,false_positives,true_negatives,false_negatives,false_alarm_rate,best_validation_auc
+LSTM,5,40,64,6051,234302,0.5,0.7937668980489674,0.907316198752038,0.0939846139586616,0.48354792560801146,0.15738010243675307,2028,19550,210558,2166,0.08496010568950232,0.7825
