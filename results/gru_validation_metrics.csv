@@ -1,0 +1,2 @@
+model,best_epoch,validation_auc,validation_accuracy,validation_precision,validation_recall,validation_f1,threshold
+GRU_baseline,9,0.7899969893164335,0.8740409207161125,0.06712850710079668,0.46564151850072083,0.1173407604746912,0.5

@@ -1,0 +1,2 @@
+model,best_epoch,test_auc,test_accuracy,test_precision,test_recall,test_f1,threshold,test_rows,test_positive_samples,test_negative_samples
+GRU_baseline,9,0.8156600502259231,0.8766975954110507,0.07871033776867963,0.550071530758226,0.13771489971346704,0.5,234302,4194,230108
