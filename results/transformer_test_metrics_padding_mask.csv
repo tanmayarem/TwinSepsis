@@ -1,0 +1,2 @@
+threshold,accuracy,precision,recall,f1,roc_auc,auprc,model,best_epoch,best_validation_roc_auc,sequence_length,batch_size
+0.5,0.9304658090840027,0.10541422048271364,0.38531235097758704,0.165539848391723,0.7580285179311501,0.08106829738751307,Transformer_padding_mask,1,0.7282751576843272,24,64
