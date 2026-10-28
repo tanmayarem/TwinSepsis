@@ -1,0 +1,15 @@
+{
+  "model": "weighted_probability_ensemble",
+  "components": [
+    "XGBoost",
+    "GRU"
+  ],
+  "xgboost_weight": 0.55,
+  "gru_weight": 0.45,
+  "selection_metric": "validation_ROC_AUC",
+  "threshold": 0.81,
+  "threshold_selection_metric": "validation_F1",
+  "validation_rows": 231472,
+  "validation_patients": 6050,
+  "test_evaluated": false
+}
