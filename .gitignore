@@ -13,6 +13,9 @@ env/
 # Dataset
 dataset/
 
+# Agent traces (operational metadata; may be patient-linked)
+results/agent_traces/
+
 # Jupyter
 .ipynb_checkpoints/
 
@@ -30,3 +33,5 @@ Thumbs.db
 archive.zip
 models/*.joblib
 mimic-iv-20261028T025157Z-1-001.zip
+
+.env.example

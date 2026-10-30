@@ -1,0 +1,74 @@
+# Scenario effect assumptions for the TwinSepsis agent.
+#
+# THIS FILE IS A TEMPLATE. Every numeric effect is deliberately "TODO" and
+# every citation is deliberately "TODO". Do not replace them with guessed
+# values. Fill them only from a cited source (trial, guideline, or a fitted
+# effect model), and record the provenance next to the number.
+#
+# These assumptions feed model-based scenarios, not causal treatment effects.
+# See src/twinsepsis/agent/simulate.py for the projection mechanics.
+
+version: 1
+status: template
+
+provenance:
+  note: >-
+    No numeric effect sizes have been entered. Until they are, simulate()
+    reports the intervention as unavailable and returns no projected risk.
+  citation: "TODO: cite the source and version used to populate every effect below"
+
+interventions:
+  no_action:
+    label: No action
+    description: Carry the latest observed values forward without an intervention.
+    citation: Not applicable
+    effects: []
+
+  fluid_bolus:
+    label: Fluid bolus
+    description: >-
+      Template for a crystalloid bolus scenario. The effect target and timing
+      must be sourced; no volume or hemodynamic effect is assumed here.
+    citation: "TODO: cite the source for the fluid-bolus effect and its uncertainty"
+    onset_hours: "TODO"
+    duration_hours: "TODO"
+    effects:
+      - target: MAP
+        delta: "TODO"
+        delta_low: "TODO"
+        delta_high: "TODO"
+        unit: mmHg
+        citation: "TODO: cite the source for the MAP effect and uncertainty bounds"
+
+  vasopressor:
+    label: Vasopressor
+    description: >-
+      Template for a vasopressor scenario. Agent, dose, titration, and effect
+      must all be sourced; no dose-response relationship is assumed here.
+    citation: "TODO: cite the source for the vasopressor effect and its uncertainty"
+    onset_hours: "TODO"
+    duration_hours: "TODO"
+    effects:
+      - target: MAP
+        delta: "TODO"
+        delta_low: "TODO"
+        delta_high: "TODO"
+        unit: mmHg
+        citation: "TODO: cite the source for the MAP effect and uncertainty bounds"
+
+  antibiotics:
+    label: Antibiotics
+    description: >-
+      Template for an antibiotic scenario. The observable short-horizon effect
+      is uncertain and must be sourced; no mortality or risk reduction is
+      assumed here.
+    citation: "TODO: cite the source for the antibiotic effect and its uncertainty"
+    onset_hours: "TODO"
+    duration_hours: "TODO"
+    effects:
+      - target: Temp
+        delta: "TODO"
+        delta_low: "TODO"
+        delta_high: "TODO"
+        unit: degC
+        citation: "TODO: cite the source for the temperature effect and uncertainty bounds"
