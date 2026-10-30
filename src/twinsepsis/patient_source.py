@@ -15,7 +15,11 @@ from pathlib import Path
 
 import pandas as pd
 
-from .agent.risk_model import PHYSIONET_FEATURE_COLUMNS, PhysioNetXGBRisk
+from .agent.risk_model import (
+    PHYSIONET_FEATURE_COLUMNS,
+    PhysioNetXGBRisk,
+    RiskModel,
+)
 from .agent.twin import PatientTwin
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +56,18 @@ def _resolve_root(dataset_root: str | Path | None) -> Path:
     return root
 
 
+def resolve_dataset_root(dataset_root: str | Path | None = None) -> Path:
+    """Return the validated PhysioNet dataset root.
+
+    Public wrapper over the internal resolution order (explicit argument, then
+    ``PHYSIONET_ROOT`` from the environment/``.env``).  Read-only callers such
+    as the dashboard need the resolved directory for display and directory
+    listing without re-implementing the lookup.
+    """
+
+    return _resolve_root(dataset_root)
+
+
 def find_patient_file(
     patient_id: str,
     dataset_root: str | Path | None = None,
@@ -83,6 +99,7 @@ def load_physionet_patient(
     patient_id: str,
     hour: int,
     dataset_root: str | Path | None = None,
+    model: RiskModel | None = None,
 ) -> PatientTwin:
     """Load history rows ``1..hour`` for one PhysioNet patient.
 
@@ -97,8 +114,12 @@ def load_physionet_patient(
     dataset_root:
         Directory containing ``training_setA``/``training_setB``.  Defaults to
         ``PHYSIONET_ROOT`` from the environment (``.env`` is loaded if present).
-
-    The returned twin uses :class:`PhysioNetXGBRisk`, the real saved artifact.
+    model:
+        Risk model to attach to the twin.  Defaults to
+        :class:`PhysioNetXGBRisk`, preserving the original XGBoost-only
+        behaviour.  Pass an :class:`EnsembleRisk` (or any other
+        :class:`RiskModel`) to score with a different backend; the model is
+        used as given, never replaced on failure.
     """
 
     if isinstance(hour, bool) or not isinstance(hour, int):
@@ -136,7 +157,7 @@ def load_physionet_patient(
     history = frame.loc[: hour - 1, list(PHYSIONET_FEATURE_COLUMNS)].copy()
     history = history.reset_index(drop=True)
 
-    model = PhysioNetXGBRisk()
+    model = model if model is not None else PhysioNetXGBRisk()
     return PatientTwin(patient_id, model, history)
 
 
@@ -145,4 +166,5 @@ __all__ = [
     "PATIENT_ID_PATTERN",
     "find_patient_file",
     "load_physionet_patient",
+    "resolve_dataset_root",
 ]

@@ -14,6 +14,15 @@ Same patient, through the configured LLM provider (requires the four
     python run_agent.py --patient-id p000001 --hour 6 \
         --request "Summarize the current risk, the top drivers, and the recent trend."
 
+The PhysioNet XGBoost + GRU ensemble needs CPython 3.12 with CPU PyTorch
+(``C:\\TwinSepsis-venvs\\gru312``) and is opt-in:
+
+    C:\\TwinSepsis-venvs\\gru312\\Scripts\\python.exe run_agent.py \
+        --patient-id p000001 --hour 6 --risk-model ensemble --tools-only
+
+Ensemble-level feature attribution is unavailable, so ``explain_risk`` is not
+exposed for that model.
+
 Output is JSON on stdout.  A JSONL operational trace is written under
 ``results/agent_traces/`` unless ``--no-trace`` is supplied.  Traces contain
 tool names, arguments and status only; they never contain patient rows, tool
@@ -38,6 +47,7 @@ from .llm import (
     create_client,
     LLMConfig,
 )
+from .risk_model import ModelUnavailableError, load_risk_model
 
 DEFAULT_REQUEST = (
     "Summarize the current model-estimated risk, the frozen threshold decision, "
@@ -78,6 +88,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--risk-model",
+        choices=("xgboost", "ensemble"),
+        default="xgboost",
+        help=(
+            "Risk model backend. 'xgboost' is the original PhysioNet XGBoost "
+            "artifact and works in the default environment. 'ensemble' is the "
+            "frozen 0.55 XGBoost / 0.45 GRU blend (threshold 0.81) and requires "
+            "the CPython 3.12 environment with CPU PyTorch. Default: xgboost."
+        ),
+    )
+    parser.add_argument(
         "--tools-only",
         action="store_true",
         help=(
@@ -110,12 +131,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _error_payload(exc: BaseException) -> dict:
-    return {
-        "error": {
-            "type": type(exc).__name__,
-            "message": str(exc),
-        }
+    error = {
+        "type": type(exc).__name__,
+        "message": str(exc),
     }
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        error["status_code"] = status_code
+    retry_after_s = getattr(exc, "retry_after_s", None)
+    if retry_after_s is not None:
+        error["retry_after_s"] = retry_after_s
+    return {"error": error}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -123,12 +149,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        risk_model = load_risk_model(args.risk_model)
         twin = load_physionet_patient(
             args.patient_id,
             args.hour,
             dataset_root=args.dataset_root,
+            model=risk_model,
         )
-    except PatientSourceError as exc:
+    except (PatientSourceError, ModelUnavailableError) as exc:
         print(json.dumps(_error_payload(exc), indent=2), file=sys.stderr)
         return 2
 

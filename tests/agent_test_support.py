@@ -139,3 +139,43 @@ class UnavailableRisk(RiskModel):
 
     def explain(self, window_df: pd.DataFrame, top_k: int = 5) -> list[dict]:
         raise NotImplementedError("unavailable")
+
+
+class PredictionOnlyRisk(RiskModel):
+    """Predicts but exposes no explanation or simulation.
+
+    This mirrors the real ensemble's capability state (prediction on,
+    ensemble-level attribution unavailable) without requiring torch.
+    """
+
+    supports_prediction = True
+    supports_explanation = False
+    supports_simulation = False
+    test_only = True
+    dataset = "PhysioNet-style synthetic fixture (not clinical data)"
+    prediction_horizon = "Scored hour only (fixture)."
+    explanation_units = None
+
+    def __init__(self) -> None:
+        super().__init__(threshold=0.81, name="PredictionOnlyRisk")
+
+    def featurize(self, window_df: pd.DataFrame) -> pd.DataFrame:
+        return window_df.iloc[[-1]].copy()
+
+    def predict_proba(self, window_df: pd.DataFrame) -> float:
+        return 0.42
+
+    def explain(self, window_df: pd.DataFrame, top_k: int = 5) -> list[dict]:
+        raise AssertionError("ensemble-level explanations must stay unavailable")
+
+
+class RenamedPredictionOnlyRisk(PredictionOnlyRisk):
+    """Prediction-only fixture whose declared ``name`` differs from its class.
+
+    Used to prove that responses, tools and traces report the model's stable
+    ``model.name`` rather than ``type(model).__name__``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = "PredictionOnlyFixtureV2"

@@ -143,17 +143,37 @@ class PatientTwin:
             risks.append(value)
         return risks
 
+    def _recent_scores(self, hours: int) -> list[float]:
+        """Score only the last ``hours + 1`` prefixes, at most the whole history."""
+
+        total = len(self._history)
+        start = max(1, total - hours)
+        risks: list[float] = []
+        for end in range(start, total + 1):
+            window = self._history.iloc[:end].copy()
+            value = float(self.model.predict_proba(window))
+            if value < 0.0 or value > 1.0:
+                raise ValueError(f"model returned probability outside [0, 1]: {value}")
+            risks.append(value)
+        return risks
+
     def trend(self, hours: int = 3) -> dict[str, Any]:
-        """Change in risk over the last ``hours`` hours."""
+        """Change in risk over the last ``hours`` hours.
+
+        Only the ``hours + 1`` most recent prefixes are scored.  That is exact
+        for prefix models: each score depends solely on rows up to its own
+        hour, so it is identical to the corresponding slice of
+        :meth:`trajectory`, without paying the full-history O(n^2) cost.
+        """
 
         if hours < 1:
             raise ValueError("hours must be >= 1")
         if self._history.empty:
             raise ValueError("twin has no history")
 
-        trajectory = self.trajectory()
-        window = min(int(hours), len(trajectory) - 1)
-        current = trajectory[-1]
+        recent = self._recent_scores(int(hours))
+        window = min(int(hours), len(recent) - 1)
+        current = recent[-1]
 
         if window == 0:
             return {
@@ -165,7 +185,7 @@ class PatientTwin:
                 "current_risk": current,
             }
 
-        previous = trajectory[-1 - window]
+        previous = recent[-1 - window]
         delta = current - previous
         if abs(delta) < 1e-9:
             direction = "stable"

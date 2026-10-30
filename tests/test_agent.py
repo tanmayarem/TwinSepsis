@@ -13,18 +13,38 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agent_test_support import (  # noqa: E402
     FailingRisk,
+    PredictionOnlyRisk,
+    RenamedPredictionOnlyRisk,
     ScriptedLLM,
     UnavailableRisk,
     make_twin,
     tool_call,
     turn,
 )
+from gru_test_support import synthetic_history  # noqa: E402
 from twinsepsis.agent.agent import (  # noqa: E402
     AGENT_RESPONSE_SCHEMA,
     MAX_TOOL_CALLS,
     AgentContextError,
     SepsisAgent,
 )
+from twinsepsis.agent.llm import LLMRateLimitError  # noqa: E402
+from twinsepsis.agent.risk_model import PhysioNetXGBRisk  # noqa: E402
+from twinsepsis.agent.tools import get_twin_state  # noqa: E402
+from twinsepsis.agent.twin import PatientTwin  # noqa: E402
+
+
+class CountingHistoryTwin(PatientTwin):
+    """Twin that counts ``history`` reads, to catch redundant full copies."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.history_reads = 0
+
+    @property
+    def history(self):
+        self.history_reads += 1
+        return super().history
 
 
 class AgentLoopTests(unittest.TestCase):
@@ -187,6 +207,76 @@ class AgentLoopTests(unittest.TestCase):
             max_tool_calls=3,
         )
         self.assertEqual(len(response["tools_used"]), 3)
+
+    def test_prediction_only_model_hides_explanation_and_simulation(self) -> None:
+        twin = make_twin(PredictionOnlyRisk())
+        response, llm, agent, _ = self.run_agent(
+            [turn(tool_call("predict_risk")), turn(content="done")],
+            twin=twin,
+        )
+
+        self.assertEqual(
+            agent.available_tools,
+            [
+                "get_twin_state",
+                "predict_risk",
+                "risk_trajectory",
+                "clinical_scores",
+                "list_interventions",
+            ],
+        )
+        exposed = {tool["function"]["name"] for tool in llm.calls[0]["tools"]}
+        self.assertNotIn("explain_risk", exposed)
+        self.assertNotIn("simulate_intervention", exposed)
+
+        self.assertIsNotNone(response["risk_summary"])
+        self.assertIsNone(response["top_drivers"])
+        self.assertEqual(response["prediction_source"]["model"], "PredictionOnlyRisk")
+        self.assertIsNone(response["prediction_source"]["explanation_units"])
+        self.assertIn("feature_attribution_unavailable", response["limitations"])
+        self.assertIn("Feature attribution is unavailable", " ".join(response["caveats"]))
+        self.assertIn("intervention_simulation_unavailable", response["limitations"])
+        self.assertIn(
+            "Intervention simulation is unavailable for this model",
+            " ".join(response["caveats"]),
+        )
+
+    def test_prediction_only_model_prompt_states_available_capabilities(self) -> None:
+        twin = make_twin(PredictionOnlyRisk())
+        _, llm, _, _ = self.run_agent(
+            [turn(tool_call("predict_risk")), turn(content="done")],
+            twin=twin,
+        )
+
+        system = llm.calls[0]["messages"][0]["content"]
+        available_line = next(
+            line for line in system.splitlines() if line.startswith("Available tools:")
+        )
+        self.assertIn("predict_risk", available_line)
+        self.assertIn("risk_trajectory", available_line)
+        self.assertNotIn("explain_risk", available_line)
+        self.assertNotIn("simulate_intervention", available_line)
+        self.assertIn("Unavailable for this risk model:", system)
+        self.assertIn("feature attribution (explain_risk)", system)
+        self.assertIn("intervention simulation (simulate_intervention)", system)
+
+    def test_declared_model_name_is_used_for_identity(self) -> None:
+        twin = make_twin(RenamedPredictionOnlyRisk())
+        response, _, agent, _ = self.run_agent(
+            [
+                turn(
+                    tool_call("predict_risk"),
+                    tool_call("risk_trajectory", {"max_hours": 2}),
+                ),
+                turn(content="done"),
+            ],
+            twin=twin,
+        )
+
+        identity = "PredictionOnlyFixtureV2"
+        self.assertEqual(response["prediction_source"]["model"], identity)
+        self.assertEqual(agent._risk_trajectory(max_hours=2)["risk_model"], identity)
+        self.assertEqual(get_twin_state(twin)["risk_model"], identity)
 
     def test_unavailable_capability_is_not_exposed(self) -> None:
         twin = make_twin(UnavailableRisk())
@@ -464,6 +554,189 @@ class AgentLoopTests(unittest.TestCase):
                 self.assertEqual(event["risk_model"], "StubRisk")
                 self.assertTrue(event["ok"])
 
+    def test_rate_limit_after_successful_tools_returns_labelled_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.jsonl"
+            twin = make_twin()
+            llm = ScriptedLLM(
+                [
+                    turn(
+                        tool_call("get_twin_state", {"trend_hours": 3}),
+                        tool_call("predict_risk"),
+                    ),
+                    LLMRateLimitError(
+                        "The LLM provider rate limit was reached (HTTP 429). "
+                        "Please retry after 30 seconds.",
+                        status_code=429,
+                        retry_after_s=30.0,
+                    ),
+                ]
+            )
+            agent = SepsisAgent(twin, llm, trace_path=path)
+            response = agent.run("assess", twin.patient_id, twin.hours)
+
+            events = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(response["mode"], "llm_agent")
+        self.assertEqual(response["summary_source"], "deterministic_fallback")
+        self.assertTrue(
+            response["risk_summary"].startswith(
+                "Deterministic system-generated summary (not an LLM response)."
+            )
+        )
+        self.assertIn("Model-estimated risk", response["risk_summary"])
+        self.assertIn("frozen threshold", response["risk_summary"])
+        self.assertIn("Risk is", response["risk_summary"])
+        self.assertEqual(
+            [item["tool"] for item in response["tools_used"]],
+            ["get_twin_state", "predict_risk"],
+        )
+        self.assertTrue(all(item["ok"] for item in response["tools_used"]))
+        self.assertIn("not an LLM-generated response", " ".join(response["caveats"]))
+        self.assertIn("rate limit", " ".join(response["caveats"]))
+        self.assertIn("llm_summary_unavailable", response["limitations"])
+
+        self.assertIn("llm_failure", [event["event"] for event in events])
+        failure = next(
+            event for event in events if event["event"] == "llm_failure"
+        )
+        self.assertEqual(failure["error_type"], "LLMRateLimitError")
+        self.assertEqual(failure["retry_after_s"], 30.0)
+        self.assertEqual(failure["completed_tool_calls"], 2)
+        self.assertEqual(events[-1]["event"], "run_end")
+        self.assertEqual(events[-1]["status"], "llm_error_fallback")
+        self.assertEqual(events[-1]["error_type"], "LLMRateLimitError")
+        self.assertEqual(events[-1]["retry_after_s"], 30.0)
+        tool_events = [event for event in events if event["event"] == "tool_call"]
+        self.assertEqual(
+            [event["tool"] for event in tool_events],
+            ["get_twin_state", "predict_risk"],
+        )
+        self.assertTrue(all(event["ok"] for event in tool_events))
+
+    def test_rate_limit_fallback_omits_trend_when_state_was_not_scored(self) -> None:
+        twin = make_twin()
+        llm = ScriptedLLM(
+            [
+                turn(tool_call("predict_risk")),
+                LLMRateLimitError(
+                    "The LLM provider rate limit was reached (HTTP 429).",
+                    status_code=429,
+                ),
+            ]
+        )
+        agent = SepsisAgent(twin, llm, trace_enabled=False)
+        response = agent.run("assess", twin.patient_id, twin.hours)
+
+        self.assertEqual(response["summary_source"], "deterministic_fallback")
+        self.assertIn("Model-estimated risk", response["risk_summary"])
+        self.assertIn("frozen threshold", response["risk_summary"])
+        self.assertNotIn("Risk is", response["risk_summary"])
+        self.assertEqual(
+            [item["tool"] for item in response["tools_used"]],
+            ["predict_risk"],
+        )
+
+    def test_rate_limit_without_a_risk_value_does_not_invent_one(self) -> None:
+        twin = make_twin(UnavailableRisk())
+        llm = ScriptedLLM(
+            [
+                turn(tool_call("clinical_scores")),
+                LLMRateLimitError(
+                    "The LLM provider rate limit was reached (HTTP 429).",
+                    status_code=429,
+                ),
+            ]
+        )
+        agent = SepsisAgent(twin, llm, trace_enabled=False)
+        response = agent.run("assess", twin.patient_id, twin.hours)
+
+        self.assertEqual(response["summary_source"], "deterministic_fallback")
+        self.assertIsNone(response["prediction_source"])
+        self.assertIsNone(response["prediction_horizon"])
+        self.assertIsNone(response["top_drivers"])
+        self.assertIsNotNone(response["clinical_scores"])
+        self.assertTrue(
+            response["risk_summary"].startswith(
+                "Deterministic system-generated summary (not an LLM response)."
+            )
+        )
+        self.assertIn("No risk value was available", response["risk_summary"])
+        self.assertEqual(
+            [item["tool"] for item in response["tools_used"]],
+            ["clinical_scores"],
+        )
+        self.assertIn("llm_summary_unavailable", response["limitations"])
+
+    def test_rate_limit_fallback_preserves_failed_tool_reporting(self) -> None:
+        twin = make_twin(FailingRisk())
+        llm = ScriptedLLM(
+            [
+                turn(
+                    tool_call("predict_risk"),
+                    tool_call("clinical_scores"),
+                ),
+                LLMRateLimitError(
+                    "The LLM provider rate limit was reached (HTTP 429).",
+                    status_code=429,
+                ),
+            ]
+        )
+        agent = SepsisAgent(twin, llm, trace_enabled=False)
+        response = agent.run("assess", twin.patient_id, twin.hours)
+
+        self.assertEqual(response["summary_source"], "deterministic_fallback")
+        statuses = [
+            (item["tool"], item["ok"], item["origin"])
+            for item in response["tools_used"]
+        ]
+        self.assertEqual(
+            statuses,
+            [
+                ("predict_risk", False, "llm"),
+                ("clinical_scores", True, "llm"),
+                ("predict_risk", False, "fallback"),
+            ],
+        )
+        self.assertIsNotNone(response["clinical_scores"])
+        self.assertIsNone(response["prediction_source"])
+        self.assertIn("failed", " ".join(response["caveats"]))
+        self.assertIn("No risk value", " ".join(response["caveats"]))
+
+    def test_rate_limit_before_any_successful_tool_is_reraised(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.jsonl"
+            twin = make_twin()
+            agent = SepsisAgent(
+                twin,
+                ScriptedLLM(
+                    [
+                        LLMRateLimitError(
+                            "The LLM provider rate limit was reached (HTTP 429).",
+                            status_code=429,
+                            retry_after_s=5.0,
+                        )
+                    ]
+                ),
+                trace_path=path,
+            )
+            with self.assertRaises(LLMRateLimitError):
+                agent.run("assess", twin.patient_id, twin.hours)
+
+            events = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertNotIn("llm_failure", [event["event"] for event in events])
+        self.assertEqual(events[-1]["event"], "run_end")
+        self.assertEqual(events[-1]["status"], "error")
+        self.assertEqual(events[-1]["error_type"], "LLMRateLimitError")
+        self.assertEqual(events[-1]["retry_after_s"], 5.0)
+
     def test_llm_exception_is_traced_and_reraised(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.jsonl"
@@ -507,6 +780,90 @@ class ToolsOnlyTests(unittest.TestCase):
         self.assertEqual(len(response["tools_used"]), 8)
         self.assertTrue(any(not item["ok"] for item in response["tools_used"]))
         self.assertIn("does not support prediction", " ".join(response["caveats"]))
+
+    def test_tools_only_with_prediction_only_model_skips_explanation(self) -> None:
+        twin = make_twin(PredictionOnlyRisk())
+        agent = SepsisAgent(twin, None, trace_enabled=False)
+        response = agent.run_tools_only(twin.patient_id, twin.hours)
+
+        self.assertEqual(response["mode"], "tools_only")
+        self.assertIsNotNone(response["risk_summary"])
+        self.assertIsNone(response["top_drivers"])
+
+        failed = [item for item in response["tools_used"] if not item["ok"]]
+        self.assertTrue(failed)
+        self.assertTrue(
+            all(item["error_type"] == "tool_unavailable" for item in failed)
+        )
+        self.assertIn("feature_attribution_unavailable", response["limitations"])
+        self.assertIn("Feature attribution is unavailable", " ".join(response["caveats"]))
+        self.assertIn("intervention_simulation_unavailable", response["limitations"])
+        self.assertIn(
+            "Intervention simulation is unavailable for this model",
+            " ".join(response["caveats"]),
+        )
+
+
+class RealModelCapabilityTests(unittest.TestCase):
+    """Capability and identity checks against the loaded XGBoost artifact."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.model = PhysioNetXGBRisk()
+
+    def test_xgboost_simulation_behaviour_is_unchanged(self) -> None:
+        twin = PatientTwin(
+            "synthetic-xgb-capabilities", self.model, synthetic_history(6)
+        )
+        agent = SepsisAgent(twin, None, trace_enabled=False)
+
+        self.assertIn("explain_risk", agent.available_tools)
+        self.assertIn("simulate_intervention", agent.available_tools)
+
+        response = agent.run_tools_only(twin.patient_id, twin.hours)
+        self.assertNotIn("feature_attribution_unavailable", response["limitations"])
+        self.assertNotIn("intervention_simulation_unavailable", response["limitations"])
+        self.assertNotIn(
+            "Intervention simulation is unavailable for this model",
+            " ".join(response["caveats"]),
+        )
+        scenarios = {item["intervention"]: item for item in response["scenarios"]}
+        self.assertIn("fluid_bolus", scenarios)
+        self.assertIn("no_action", scenarios)
+
+    def test_identity_is_consistent_across_tools_and_response(self) -> None:
+        twin = PatientTwin(
+            "synthetic-xgb-identity", self.model, synthetic_history(6)
+        )
+        llm = ScriptedLLM(
+            [
+                turn(
+                    tool_call("predict_risk"),
+                    tool_call("get_twin_state"),
+                    tool_call("risk_trajectory", {"max_hours": 3}),
+                ),
+                turn(content="done"),
+            ]
+        )
+        agent = SepsisAgent(twin, llm, trace_enabled=False)
+        response = agent.run("assess", twin.patient_id, twin.hours)
+
+        identity = "PhysioNetXGBRisk"
+        self.assertEqual(response["prediction_source"]["model"], identity)
+        self.assertEqual(agent._risk_trajectory(max_hours=3)["risk_model"], identity)
+        self.assertEqual(get_twin_state(twin)["risk_model"], identity)
+
+    def test_risk_trajectory_reads_history_once(self) -> None:
+        twin = CountingHistoryTwin(
+            "synthetic-xgb-copies", self.model, synthetic_history(8)
+        )
+        agent = SepsisAgent(twin, None, trace_enabled=False)
+
+        twin.history_reads = 0
+        result = agent._risk_trajectory(max_hours=4)
+
+        self.assertEqual(len(result["risks"]), 4)
+        self.assertEqual(twin.history_reads, 1)
 
 
 if __name__ == "__main__":

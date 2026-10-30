@@ -16,6 +16,8 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -44,9 +46,55 @@ class LLMConfigurationError(LLMError):
 class LLMNetworkError(LLMError):
     """Raised for transport failures and non-2xx HTTP responses."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_s: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_s = retry_after_s
+
+
+class LLMRateLimitError(LLMNetworkError):
+    """Raised when the provider rejects a request because of rate limiting."""
+
 
 class LLMResponseError(LLMError):
     """Raised when the provider returns a payload we cannot interpret."""
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a ``Retry-After`` header into non-negative seconds.
+
+    The header may be a number of seconds or an HTTP date.  Invalid values are
+    ignored rather than turned into a retry loop; the client never retries.
+    """
+
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+
+    if seconds < 0:
+        return 0.0
+    return round(seconds, 3)
 
 
 @dataclass(frozen=True)
@@ -232,18 +280,44 @@ class OpenAICompatibleClient:
             ) from exc
 
         if response.status_code >= 400:
-            detail = response.text[:300].strip()
+            retry_after_s = _parse_retry_after(response.headers.get("retry-after"))
+            if response.status_code == 429:
+                if retry_after_s is None:
+                    message = (
+                        "The LLM provider rate limit was reached (HTTP 429). "
+                        "Please try again later."
+                    )
+                else:
+                    message = (
+                        "The LLM provider rate limit was reached (HTTP 429). "
+                        f"Please retry after {retry_after_s:g} seconds."
+                    )
+                raise LLMRateLimitError(
+                    message,
+                    status_code=response.status_code,
+                    retry_after_s=retry_after_s,
+                )
+
             if response.status_code in {401, 403}:
                 message = (
                     f"LLM authentication failed (HTTP {response.status_code}); "
                     "check the API key in the environment."
                 )
+            elif response.status_code >= 500:
+                message = (
+                    "The LLM provider is temporarily unavailable "
+                    f"(HTTP {response.status_code}). Please try again later."
+                )
             else:
                 message = (
-                    f"LLM endpoint returned HTTP {response.status_code}"
-                    + (f": {detail}" if detail else "")
+                    "The LLM provider rejected the request "
+                    f"(HTTP {response.status_code})."
                 )
-            raise LLMNetworkError(message)
+            raise LLMNetworkError(
+                message,
+                status_code=response.status_code,
+                retry_after_s=retry_after_s,
+            )
 
         try:
             data = response.json()
@@ -347,6 +421,7 @@ __all__ = [
     "LLMError",
     "LLMConfigurationError",
     "LLMNetworkError",
+    "LLMRateLimitError",
     "LLMResponseError",
     "LLMConfig",
     "ToolCallRequest",

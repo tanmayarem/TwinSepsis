@@ -25,7 +25,8 @@ from typing import Any, Mapping, Sequence
 import jsonschema
 from jsonschema.exceptions import best_match
 
-from .llm import AssistantTurn, ChatClient, ToolCallRequest
+from .llm import AssistantTurn, ChatClient, LLMError, ToolCallRequest
+from .risk_model import model_identity
 from .trace import TraceLogger
 from .twin import PatientTwin
 
@@ -311,6 +312,7 @@ AGENT_RESPONSE_SCHEMA: dict[str, Any] = {
         "needs_clinician_review",
         "tools_used",
         "mode",
+        "summary_source",
         "disclaimer",
     ],
     "properties": {
@@ -342,6 +344,9 @@ AGENT_RESPONSE_SCHEMA: dict[str, Any] = {
             },
         },
         "mode": {"enum": ["llm_agent", "tools_only"]},
+        "summary_source": {
+            "enum": ["llm_agent", "deterministic_fallback", "tools_only"]
+        },
         "disclaimer": {"type": "string"},
     },
 }
@@ -389,6 +394,19 @@ def _add_unique(items: list[str], value: str) -> None:
         items.append(value)
 
 
+def _llm_failure_note(exc: LLMError) -> str:
+    """A short, provider-body-free description for fallback responses."""
+
+    if getattr(exc, "status_code", None) == 429:
+        note = "provider rate limit reached (HTTP 429)"
+    else:
+        note = type(exc).__name__
+    retry_after = getattr(exc, "retry_after_s", None)
+    if isinstance(retry_after, (int, float)):
+        note += f"; retry after {retry_after:g} s"
+    return note
+
+
 def _build_response(
     twin: PatientTwin,
     hour: int,
@@ -398,6 +416,8 @@ def _build_response(
     limit_reached: bool,
     max_tool_calls: int,
     prediction_fallback_skipped: bool = False,
+    summary_source: str = "llm_agent",
+    fallback_reason: str | None = None,
 ) -> dict[str, Any]:
     model = twin.model
     prediction = _last_ok(results, "predict_risk")
@@ -446,6 +466,13 @@ def _build_response(
     if not getattr(model, "supports_explanation", True):
         _add_unique(caveats, "Feature attribution is unavailable for this model.")
         _add_unique(limitations, "feature_attribution_unavailable")
+    if not getattr(model, "supports_simulation", True):
+        _add_unique(
+            caveats,
+            "Intervention simulation is unavailable for this model, so "
+            "simulation tools were not exposed.",
+        )
+        _add_unique(limitations, "intervention_simulation_unavailable")
 
     risk_summary: str | None = None
     prediction_source: dict[str, Any] | None = None
@@ -524,6 +551,16 @@ def _build_response(
                 "the prediction tool.",
             )
         _add_unique(limitations, "risk_prediction_unavailable")
+
+    if summary_source == "deterministic_fallback":
+        label = "Deterministic system-generated summary (not an LLM response)."
+        if risk_summary is None:
+            risk_summary = (
+                label
+                + " No risk value was available from the completed tool calls."
+            )
+        else:
+            risk_summary = f"{label} {risk_summary}"
 
     if explanation is not None:
         top_drivers = list(explanation.get("explanations") or [])
@@ -644,6 +681,18 @@ def _build_response(
             "No LLM was used: this is a deterministic tool demonstration.",
         )
 
+    if summary_source == "deterministic_fallback":
+        reason = f" ({fallback_reason})" if fallback_reason else ""
+        _add_unique(
+            caveats,
+            "The LLM planner failed"
+            + reason
+            + "; this is a deterministic, system-generated summary assembled "
+            "from the completed tool results. It is not an LLM-generated "
+            "response, and no missing value was filled in.",
+        )
+        _add_unique(limitations, "llm_summary_unavailable")
+
     if not results:
         _add_unique(
             caveats,
@@ -678,6 +727,7 @@ def _build_response(
             for run in results
         ],
         "mode": mode,
+        "summary_source": summary_source,
         "disclaimer": DISCLAIMER,
     }
     return _json_safe(response)
@@ -842,9 +892,10 @@ class SepsisAgent:
             raise ValueError("twin has no history")
 
         start = max(1, total - max_hours + 1)
+        history = self.twin.history
         points: list[dict[str, Any]] = []
         for end in range(start, total + 1):
-            window = self.twin.history.iloc[:end].copy()
+            window = history.iloc[:end].copy()
             risk = float(self.twin.model.predict_proba(window))
             if not 0.0 <= risk <= 1.0:
                 raise ValueError(f"model returned probability outside [0, 1]: {risk}")
@@ -856,10 +907,21 @@ class SepsisAgent:
             "from_hour": start,
             "to_hour": total,
             "threshold": self.twin.model.threshold,
-            "risk_model": type(self.twin.model).__name__,
+            "risk_model": model_identity(self.twin.model),
             "risks": points,
             "note": "Each point uses only data available at that hour.",
         }
+
+    def risk_trajectory(self, max_hours: int = 24) -> dict[str, Any]:
+        """Public access to the causal historical trajectory.
+
+        The dashboard needs the same prefix-based scoring the ``risk_trajectory``
+        tool returns, without going through the LLM or an ``AgentContext``.  It
+        delegates here so there is exactly one implementation of the scoring
+        loop and one source of model identity.
+        """
+
+        return self._risk_trajectory(max_hours=max_hours)
 
     # -- tracing -------------------------------------------------------
 
@@ -874,7 +936,7 @@ class SepsisAgent:
             error_type=run.error_type,
             duration_ms=run.duration_ms,
             origin=run.origin,
-            risk_model=type(self.twin.model).__name__,
+            risk_model=model_identity(self.twin.model),
             llm_provider=getattr(self._llm, "provider", None),
             llm_model=getattr(self._llm, "model", None),
         )
@@ -960,7 +1022,7 @@ class SepsisAgent:
                 tool="predict_risk",
                 reason="tool_call_limit",
                 call_index=index,
-                risk_model=type(self.twin.model).__name__,
+                risk_model=model_identity(self.twin.model),
                 llm_provider=getattr(self._llm, "provider", None),
                 llm_model=getattr(self._llm, "model", None),
             )
@@ -976,7 +1038,7 @@ class SepsisAgent:
             tool="predict_risk",
             reason="no_successful_prediction_after_llm_loop",
             call_index=index,
-            risk_model=type(self.twin.model).__name__,
+            risk_model=model_identity(self.twin.model),
             llm_provider=getattr(self._llm, "provider", None),
             llm_model=getattr(self._llm, "model", None),
         )
@@ -1026,12 +1088,38 @@ class SepsisAgent:
             "content": json.dumps(payload, allow_nan=False, ensure_ascii=False),
         }
 
+    def _system_prompt(self, available: list[str]) -> str:
+        """Append the concrete capability set to the fixed system prompt."""
+
+        model = self.twin.model
+        unavailable: list[str] = []
+        if not getattr(model, "supports_prediction", True):
+            unavailable.append("risk prediction")
+        if not getattr(model, "supports_explanation", True):
+            unavailable.append("feature attribution (explain_risk)")
+        if not getattr(model, "supports_simulation", True):
+            unavailable.append("intervention simulation (simulate_intervention)")
+
+        lines = [
+            SYSTEM_PROMPT.rstrip(),
+            "",
+            "Available tools: " + ", ".join(available) + ".",
+            "Only these tools are exposed. Do not attempt unavailable tools.",
+        ]
+        if unavailable:
+            lines.append(
+                "Unavailable for this risk model: "
+                + "; ".join(unavailable)
+                + ". State that plainly if asked; do not call or invent them."
+            )
+        return "\n".join(lines)
+
     def _user_message(self, request: str, hour: int) -> str:
         return (
             f"Clinician request: {request}\n\n"
             f"Patient context: patient_id={self.twin.patient_id!r}, "
             f"scored ICU hour={hour} (1-based), history rows={self.twin.hours}, "
-            f"risk model={type(self.twin.model).__name__!r}.\n"
+            f"risk model={model_identity(self.twin.model)!r}.\n"
             "The patient and hour are fixed. Use the tools to obtain any "
             "patient-specific values. Do not estimate a probability yourself."
         )
@@ -1053,7 +1141,7 @@ class SepsisAgent:
         available = self.available_tools
         tools = openai_tool_specs(available)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": self._system_prompt(available)},
             {"role": "user", "content": self._user_message(request, hour)},
         ]
         results: list[_ToolRun] = []
@@ -1064,13 +1152,14 @@ class SepsisAgent:
             mode="llm_agent",
             hour=hour,
             history_rows=self.twin.hours,
-            risk_model=type(self.twin.model).__name__,
+            risk_model=model_identity(self.twin.model),
             llm_provider=getattr(self._llm, "provider", None),
             llm_model=getattr(self._llm, "model", None),
             max_tool_calls=self.max_tool_calls,
             available_tools=available,
         )
 
+        llm_failure: LLMError | None = None
         try:
             while True:
                 turn = self._llm.complete(messages, tools)
@@ -1089,7 +1178,7 @@ class SepsisAgent:
                             tool=call.name,
                             tool_call_id=call.id,
                             reason="tool_call_limit",
-                            risk_model=type(self.twin.model).__name__,
+                            risk_model=model_identity(self.twin.model),
                             llm_provider=getattr(self._llm, "provider", None),
                             llm_model=getattr(self._llm, "model", None),
                         )
@@ -1110,6 +1199,31 @@ class SepsisAgent:
 
                 if stop_after_turn:
                     break
+        except LLMError as exc:
+            # A provider failure is terminal for the LLM loop: never retry it.
+            # If tools already produced usable results, keep them and build a
+            # deterministic summary below instead of discarding real work.
+            successful = [run for run in results if run.ok]
+            if not successful:
+                self._trace.record(
+                    "run_end",
+                    status="error",
+                    mode="llm_agent",
+                    error_type=type(exc).__name__,
+                    tool_calls=len(results),
+                    retry_after_s=getattr(exc, "retry_after_s", None),
+                )
+                raise
+            llm_failure = exc
+            self._trace.record(
+                "llm_failure",
+                mode="llm_agent",
+                error_type=type(exc).__name__,
+                retry_after_s=getattr(exc, "retry_after_s", None),
+                completed_tool_calls=len(successful),
+                failed_tool_calls=sum(1 for run in results if not run.ok),
+                summary_source="deterministic_fallback",
+            )
         except Exception as exc:
             self._trace.record(
                 "run_end",
@@ -1130,13 +1244,23 @@ class SepsisAgent:
             limit_reached=limit_reached,
             max_tool_calls=self.max_tool_calls,
             prediction_fallback_skipped=prediction_fallback_skipped,
+            summary_source=(
+                "deterministic_fallback" if llm_failure is not None else "llm_agent"
+            ),
+            fallback_reason=(
+                _llm_failure_note(llm_failure)
+                if llm_failure is not None
+                else None
+            ),
         )
         _validate_response(response)
 
         self._trace.record(
             "run_end",
             status=(
-                "limit_reached"
+                "llm_error_fallback"
+                if llm_failure is not None
+                else "limit_reached"
                 if limit_reached
                 else "completed"
                 if results
@@ -1145,6 +1269,15 @@ class SepsisAgent:
             mode="llm_agent",
             tool_calls=len(results),
             failed_tool_calls=sum(1 for run in results if not run.ok),
+            error_type=(
+                type(llm_failure).__name__ if llm_failure is not None else None
+            ),
+            retry_after_s=(
+                getattr(llm_failure, "retry_after_s", None)
+                if llm_failure is not None
+                else None
+            ),
+            summary_source=response["summary_source"],
         )
         return response
 
@@ -1175,7 +1308,7 @@ class SepsisAgent:
             mode="tools_only",
             hour=hour,
             history_rows=self.twin.hours,
-            risk_model=type(self.twin.model).__name__,
+            risk_model=model_identity(self.twin.model),
             llm_provider=None,
             llm_model=None,
             max_tool_calls=self.max_tool_calls,
@@ -1229,6 +1362,7 @@ class SepsisAgent:
             mode="tools_only",
             limit_reached=limit_reached,
             max_tool_calls=self.max_tool_calls,
+            summary_source="tools_only",
         )
         _validate_response(response)
 

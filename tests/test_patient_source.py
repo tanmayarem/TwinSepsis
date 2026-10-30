@@ -13,7 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from twinsepsis import patient_source  # noqa: E402
-from twinsepsis.agent.risk_model import PHYSIONET_FEATURE_COLUMNS, PhysioNetXGBRisk  # noqa: E402
+from twinsepsis.agent.risk_model import (  # noqa: E402
+    PHYSIONET_FEATURE_COLUMNS,
+    PhysioNetXGBRisk,
+    StubRisk,
+)
 from twinsepsis.patient_source import (  # noqa: E402
     PatientSourceError,
     load_physionet_patient,
@@ -68,6 +72,19 @@ class PatientSourceTests(unittest.TestCase):
             self.assertEqual(float(twin.latest["ICULOS"]), 2.0)
             self.assertGreaterEqual(twin.risk(), 0.0)
             self.assertLessEqual(twin.risk(), 1.0)
+
+    def test_injected_model_is_attached_unchanged(self) -> None:
+        model = StubRisk()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_patient(root)
+
+            twin = load_physionet_patient(
+                "p123456", 2, dataset_root=root, model=model
+            )
+
+        self.assertIs(twin.model, model)
+        self.assertEqual(twin.hours, 2)
 
     def test_finds_patient_in_training_set_b(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

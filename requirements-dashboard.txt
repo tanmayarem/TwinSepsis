@@ -1,0 +1,15 @@
+# Extra dependencies for the Streamlit dashboard.
+#
+# Install these INTO the CPython 3.12 ensemble environment; they are additive to
+# requirements-gru.txt and do not replace it:
+#
+#   uv pip install --python C:\TwinSepsis-venvs\gru312\Scripts\python.exe `
+#       -r requirements-dashboard.txt
+#
+# Versions below match what the dashboard was verified against.  They resolve
+# without touching the pinned numpy/pandas/torch/xgboost builds, so the
+# ensemble keeps working in the same interpreter.
+
+streamlit==1.66.1
+altair==6.3.0
+pyarrow==26.0.0

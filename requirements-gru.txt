@@ -1,0 +1,30 @@
+# Isolated runtime for the PhysioNet XGBoost + GRU ensemble.
+#
+# Python 3.12 (verified with CPython 3.12.13), CPU only.  This file is separate
+# from the project's default requirements.txt, which targets Python 3.14 and
+# deliberately does not include PyTorch.
+#
+# torch is not published on PyPI under the "+cpu" local version, so install it
+# from the official CPU index before installing this file:
+#
+#   uv venv --python 3.12 C:\TwinSepsis-venvs\gru312
+#   uv pip install --python C:\TwinSepsis-venvs\gru312\Scripts\python.exe "numpy==2.5.3"
+#   uv pip install --python C:\TwinSepsis-venvs\gru312\Scripts\python.exe `
+#       --index-url https://download.pytorch.org/whl/cpu "torch==2.15.0+cpu"
+#   uv pip install --python C:\TwinSepsis-venvs\gru312\Scripts\python.exe `
+#       -r requirements-gru.txt
+#
+# Then run the ensemble with:
+#
+#   C:\TwinSepsis-venvs\gru312\Scripts\python.exe run_agent.py `
+#       --patient-id p000001 --hour 6 --risk-model ensemble --tools-only
+
+numpy==2.5.3
+pandas==3.0.6
+scipy==1.18.1
+scikit-learn==1.9.1
+xgboost==3.4.1
+python-dotenv==1.2.4
+PyYAML==6.0.3
+jsonschema==4.26.0
+httpx==0.28.1

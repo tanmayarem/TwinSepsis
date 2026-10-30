@@ -19,6 +19,7 @@ from twinsepsis.agent.llm import (  # noqa: E402
     LLMConfig,
     LLMConfigurationError,
     LLMNetworkError,
+    LLMRateLimitError,
     LLMResponseError,
     OpenAICompatibleClient,
     create_client,
@@ -178,7 +179,65 @@ class ClientTests(unittest.TestCase):
         finally:
             http_client.close()
         self.assertIn("500", str(context.exception))
+        self.assertNotIn("upstream exploded", str(context.exception))
         self.assertNotIn("test-key-not-a-real-secret", str(context.exception))
+
+    def test_rate_limit_is_sanitised_and_retry_after_is_parsed(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "12.5"},
+                text='{"error":{"message":"raw provider detail with test-key-not-a-real-secret"}}',
+            )
+
+        client, http_client = make_client(handler)
+        try:
+            with self.assertRaises(LLMRateLimitError) as context:
+                client.complete([{"role": "user", "content": "hi"}], [])
+        finally:
+            http_client.close()
+
+        error = context.exception
+        self.assertIsInstance(error, LLMNetworkError)
+        self.assertEqual(error.status_code, 429)
+        self.assertEqual(error.retry_after_s, 12.5)
+        self.assertIn("rate limit", str(error))
+        self.assertIn("12.5 seconds", str(error))
+        self.assertNotIn("raw provider detail", str(error))
+        self.assertNotIn("test-key-not-a-real-secret", str(error))
+
+    def test_rate_limit_without_retry_after_still_has_a_safe_message(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, text="quota exceeded for this key")
+
+        client, http_client = make_client(handler)
+        try:
+            with self.assertRaises(LLMRateLimitError) as context:
+                client.complete([{"role": "user", "content": "hi"}], [])
+        finally:
+            http_client.close()
+
+        error = context.exception
+        self.assertIsNone(error.retry_after_s)
+        self.assertIn("HTTP 429", str(error))
+        self.assertNotIn("quota exceeded", str(error))
+
+    def test_rate_limit_accepts_an_http_date_retry_after(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"},
+            )
+
+        client, http_client = make_client(handler)
+        try:
+            with self.assertRaises(LLMRateLimitError) as context:
+                client.complete([{"role": "user", "content": "hi"}], [])
+        finally:
+            http_client.close()
+
+        # The date is in the past, so it must be clamped rather than negative.
+        self.assertEqual(context.exception.retry_after_s, 0.0)
 
     def test_auth_error_is_clear(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:

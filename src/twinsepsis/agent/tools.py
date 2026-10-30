@@ -17,6 +17,7 @@ from typing import Any, Mapping
 import numpy as np
 import pandas as pd
 
+from .risk_model import model_identity
 from .simulate import list_intervention_specs, simulate
 from .twin import PatientTwin
 
@@ -362,7 +363,7 @@ def get_twin_state(twin: PatientTwin, trend_hours: int = 3) -> dict[str, Any]:
             "threshold": twin.model.threshold,
             "exceeds_threshold": risk >= twin.model.threshold,
             "trend": twin.trend(trend_hours),
-            "risk_model": type(twin.model).__name__,
+            "risk_model": model_identity(twin.model),
             "latest_values": twin.latest.to_dict(),
             "disclaimer": (
                 "Risk is produced by the configured model for the latest hour. "
@@ -384,7 +385,7 @@ def predict_risk(twin: PatientTwin) -> dict[str, Any]:
             "risk": risk,
             "threshold": twin.model.threshold,
             "exceeds_threshold": risk >= twin.model.threshold,
-            "risk_model": type(twin.model).__name__,
+            "risk_model": model_identity(twin.model),
         }
     )
 
@@ -405,7 +406,7 @@ def explain_risk(twin: PatientTwin, top_k: int = 5) -> dict[str, Any]:
             "threshold": twin.model.threshold,
             "top_k": top_k,
             "explanations": explanations,
-            "risk_model": type(twin.model).__name__,
+            "risk_model": model_identity(twin.model),
             "disclaimer": (
                 "Contributions are model attributions for this hour, not causal "
                 "effects. Positive values push the model output up."

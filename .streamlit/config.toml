@@ -1,0 +1,13 @@
+# Streamlit theme for the TwinSepsis dashboard.
+# Dark navy clinical base with teal accents; matches twinsepsis/dashboard/theme.py.
+
+[theme]
+base = "dark"
+primaryColor = "#2FD6C0"
+backgroundColor = "#070E1A"
+secondaryBackgroundColor = "#0E1A2B"
+textColor = "#E9F1FB"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"

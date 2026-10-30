@@ -1,7 +1,7 @@
 """Model-agnostic risk-model interface for the TwinSepsis agent.
 
-The agent should not care whether risk comes from the existing PhysioNet
-XGBoost artifact, the (future) MIMIC ensemble, or a test double.  Every
+The agent should not care whether risk comes from the PhysioNet XGBoost
+artifact, the PhysioNet XGBoost + GRU ensemble, or a test double.  Every
 implementation of :class:`RiskModel` therefore exposes the same four things:
 
 * ``featurize(window_df)`` -- turn a patient's hourly window into model input;
@@ -28,6 +28,27 @@ from xgboost import DMatrix, XGBClassifier
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_XGB_MODEL_PATH = PROJECT_ROOT / "models" / "xgboost_baseline.json"
 DEFAULT_ENSEMBLE_CONFIG_PATH = PROJECT_ROOT / "results" / "ensemble_config.json"
+
+
+def model_identity(model: Any) -> str:
+    """Stable, human-readable model identifier for responses and traces.
+
+    Uses the model's declared ``name`` when present and falls back to the
+    class name for third-party implementations that do not set one.
+    """
+
+    name = getattr(model, "name", None)
+    if isinstance(name, str) and name.strip():
+        return name
+    return type(model).__name__
+
+
+class ModelUnavailableError(RuntimeError):
+    """Raised when a required model component cannot be loaded.
+
+    The agent never substitutes a different model (for example XGBoost-only
+    risk when the GRU is missing), so this error always aborts the run.
+    """
 
 
 class RiskModel(ABC):
@@ -261,32 +282,59 @@ class PhysioNetXGBRisk(RiskModel):
 
 
 # ---------------------------------------------------------------------------
-# Weighted XGBoost + GRU ensemble (scaffold)
+# Weighted XGBoost + GRU ensemble
 # ---------------------------------------------------------------------------
 
 
-class EnsembleRisk(RiskModel):
-    """Weighted probability ensemble: ``w * p_gru + (1 - w) * p_xgb``.
+def _required_config_float(config: Mapping[str, Any], key: str) -> float:
+    if key not in config:
+        raise ValueError(f"ensemble config must define {key!r}")
+    try:
+        value = float(config[key])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"ensemble config {key!r} is not numeric") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"ensemble config {key!r} must be finite")
+    return value
 
-    Weights and threshold are loaded from ``results/ensemble_config.json``.
-    The class is deliberately a scaffold: the repository has no MIMIC-IV
-    component models, and the existing PhysioNet GRU checkpoint cannot be
-    loaded in the committed environment (``torch`` is absent).  Calling
-    :meth:`predict_proba` or :meth:`explain` raises ``NotImplementedError``
-    rather than returning a fabricated probability.
+
+class EnsembleRisk(RiskModel):
+    """Weighted probability ensemble ``0.55 * p_xgb + 0.45 * p_gru``.
+
+    Weights and the decision threshold are read from
+    ``results/ensemble_config.json`` and are never passed in by callers, so the
+    frozen validation-selected values (0.55 / 0.45, threshold 0.81) cannot
+    drift at inference time.
+
+    Both components are constructed eagerly.  If either fails to load, the
+    constructor raises :class:`ModelUnavailableError`; it never falls back to
+    XGBoost-only risk.
+
+    ``supports_explanation`` is ``False``: the repository defines no
+    ensemble-level attribution, and XGBoost-only TreeSHAP values would
+    describe one component rather than the blend.  ``supports_simulation`` is
+    ``False`` because counterfactual re-scoring of the ensemble has not been
+    validated.
     """
 
-    supports_prediction = False
+    supports_prediction = True
     supports_explanation = False
     supports_simulation = False
-    dataset = "MIMIC-IV (model not available)"
+
+    dataset = "PhysioNet Challenge 2019"
     explanation_units = None
-    prediction_horizon = "Unknown (no MIMIC-IV model is available)."
+    prediction_horizon = (
+        "Scored ICU hour; XGBoost uses the scored hour's 40 features and the "
+        "GRU uses the causal hourly prefix. Not a multi-hour forecast."
+    )
 
     def __init__(
         self,
         config_path: str | Path | None = None,
-        threshold: float | None = None,
+        *,
+        xgboost_model: Any | None = None,
+        gru_model: Any | None = None,
+        gru_model_path: str | Path | None = None,
     ) -> None:
         path = (
             Path(config_path)
@@ -298,54 +346,143 @@ class EnsembleRisk(RiskModel):
 
         with path.open("r", encoding="utf-8") as handle:
             config = json.load(handle)
+        if not isinstance(config, dict):
+            raise ValueError(f"ensemble config must contain a JSON object: {path}")
 
-        xgboost_weight = config.get("xgboost_weight")
-        gru_weight = config.get("gru_weight")
-        if xgboost_weight is None or gru_weight is None:
-            raise ValueError("ensemble config must define xgboost_weight and gru_weight")
+        if config.get("model") != "weighted_probability_ensemble":
+            raise ValueError(
+                "ensemble config model must be 'weighted_probability_ensemble', "
+                f"got {config.get('model')!r}"
+            )
 
-        xgboost_weight = float(xgboost_weight)
-        gru_weight = float(gru_weight)
+        declared_components = [str(item) for item in config.get("components", ())]
+        if sorted(declared_components) != ["GRU", "XGBoost"]:
+            raise ValueError(
+                "ensemble config components must be ['XGBoost', 'GRU'], got "
+                f"{declared_components}"
+            )
+
+        xgboost_weight = _required_config_float(config, "xgboost_weight")
+        gru_weight = _required_config_float(config, "gru_weight")
         if not math.isclose(xgboost_weight + gru_weight, 1.0, abs_tol=1e-6):
             raise ValueError(
                 "ensemble weights must sum to 1.0, got "
                 f"{xgboost_weight} + {gru_weight}"
             )
 
-        configured_threshold = threshold if threshold is not None else config.get("threshold", 0.5)
-        super().__init__(threshold=float(configured_threshold), name="EnsembleRisk")
+        threshold = _required_config_float(config, "threshold")
+
+        super().__init__(threshold=threshold, name="PhysioNetXGBGRUEnsemble")
 
         self.config_path = path
-        self.config = config
+        self.config = dict(config)
         self.xgboost_weight = xgboost_weight
         self.gru_weight = gru_weight
-        self.components = tuple(config.get("components", ()))
+        self.components = tuple(declared_components)
+
+        if xgboost_model is None:
+            xgboost_component = self._construct("XGBoost", PhysioNetXGBRisk)
+        else:
+            xgboost_component = xgboost_model
+
+        if gru_model is None:
+            def _build_gru() -> RiskModel:
+                from .gru_model import PhysioNetGRURisk
+
+                return PhysioNetGRURisk(model_path=gru_model_path)
+
+            gru_component = self._construct("GRU", _build_gru)
+        else:
+            gru_component = gru_model
+
+        for component_name, component in (
+            ("XGBoost", xgboost_component),
+            ("GRU", gru_component),
+        ):
+            if not callable(getattr(component, "predict_proba", None)):
+                raise TypeError(
+                    f"{component_name} component does not implement predict_proba()"
+                )
+
+        xgboost_features = getattr(xgboost_component, "feature_names", None)
+        gru_features = getattr(gru_component, "feature_columns", None)
+        if xgboost_features is not None and gru_features is not None:
+            if [str(column) for column in xgboost_features] != [
+                str(column) for column in gru_features
+            ]:
+                raise ValueError(
+                    "XGBoost and GRU feature names/order differ; refusing to "
+                    "blend components trained on different inputs"
+                )
+
+        self._xgboost = xgboost_component
+        self._gru = gru_component
+
+        artifacts = [
+            getattr(xgboost_component, "artifact", None),
+            getattr(gru_component, "artifact", None),
+        ]
+        self.artifact = " + ".join(
+            item for item in artifacts if isinstance(item, str)
+        ) or None
+
+    @staticmethod
+    def _construct(component_name: str, factory: Any) -> RiskModel:
+        try:
+            return factory()
+        except Exception as exc:
+            raise ModelUnavailableError(
+                f"The {component_name} component of the PhysioNet ensemble could "
+                "not be loaded. The ensemble requires both components and will "
+                "not fall back to XGBoost-only risk. "
+                f"Underlying error: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def combine(self, p_gru: float, p_xgb: float) -> float:
         """Apply the frozen linear combination to two probabilities."""
 
-        p_gru = float(p_gru)
-        p_xgb = float(p_xgb)
-        if not (0.0 <= p_gru <= 1.0 and 0.0 <= p_xgb <= 1.0):
-            raise ValueError("component probabilities must be in [0, 1]")
-        return self.gru_weight * p_gru + self.xgboost_weight * p_xgb
+        probabilities = {"GRU": float(p_gru), "XGBoost": float(p_xgb)}
+        for name, value in probabilities.items():
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(
+                    f"{name} probability must be finite and in [0, 1], got {value!r}"
+                )
+        return self.gru_weight * probabilities["GRU"] + self.xgboost_weight * probabilities["XGBoost"]
 
-    def _unavailable(self) -> NotImplementedError:
-        return NotImplementedError(
-            "EnsembleRisk is scaffolded but not usable: no MIMIC-IV component "
-            "models exist in this repository, and the PhysioNet GRU checkpoint "
-            "cannot be loaded because torch is not installed. Weights and "
-            "threshold were loaded from the config; no probability was produced."
+    def featurize(self, window_df: pd.DataFrame | Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "xgboost": self._xgboost.featurize(window_df),
+            "gru": self._gru.featurize(window_df),
+        }
+
+    def component_probabilities(
+        self, window_df: pd.DataFrame | Mapping[str, Any]
+    ) -> dict[str, float]:
+        """Return both component probabilities used by the frozen blend."""
+
+        return {
+            "gru": float(self._gru.predict_proba(window_df)),
+            "xgboost": float(self._xgboost.predict_proba(window_df)),
+        }
+
+    def predict_proba(self, window_df: pd.DataFrame | Mapping[str, Any]) -> float:
+        components = self.component_probabilities(window_df)
+        probability = self.combine(components["gru"], components["xgboost"])
+        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            raise ValueError("ensemble produced an invalid probability")
+        return probability
+
+    def explain(
+        self,
+        window_df: pd.DataFrame | Mapping[str, Any],
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError(
+            "Ensemble-level feature attribution is not defined for this model. "
+            "XGBoost TreeSHAP values describe only the XGBoost component and "
+            "would misrepresent the weighted blend, so they are not presented "
+            "as ensemble explanations."
         )
-
-    def featurize(self, window_df: pd.DataFrame) -> Any:
-        raise self._unavailable()
-
-    def predict_proba(self, window_df: pd.DataFrame) -> float:
-        raise self._unavailable()
-
-    def explain(self, window_df: pd.DataFrame, top_k: int = 5) -> list[dict[str, Any]]:
-        raise self._unavailable()
 
 
 # ---------------------------------------------------------------------------
@@ -466,12 +603,54 @@ def load_default_risk_model() -> RiskModel:
         ) from exc
 
 
+def load_risk_model(name: str = "xgboost") -> RiskModel:
+    """Load one of the supported production risk models by name.
+
+    ``xgboost`` keeps the original XGBoost-only behaviour and works in the
+    project's Python 3.14 environment.  ``ensemble`` is the PhysioNet
+    XGBoost + GRU blend and requires the isolated CPython 3.12 environment
+    with CPU PyTorch.  Failures are reported as :class:`ModelUnavailableError`;
+    there is no fallback from ``ensemble`` to ``xgboost``.
+    """
+
+    if not isinstance(name, str):
+        raise TypeError("risk model name must be a string")
+    normalized = name.strip().lower()
+
+    if normalized == "xgboost":
+        try:
+            return PhysioNetXGBRisk()
+        except Exception as exc:
+            raise ModelUnavailableError(
+                "The PhysioNet XGBoost artifact could not be loaded from "
+                f"{DEFAULT_XGB_MODEL_PATH}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    if normalized == "ensemble":
+        try:
+            return EnsembleRisk()
+        except ModelUnavailableError:
+            raise
+        except Exception as exc:
+            raise ModelUnavailableError(
+                "The PhysioNet XGBoost + GRU ensemble could not be loaded using "
+                f"{DEFAULT_ENSEMBLE_CONFIG_PATH}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    raise ValueError(
+        f"unknown risk model {name!r}; expected 'xgboost' or 'ensemble'"
+    )
+
+
 __all__ = [
     "RiskModel",
     "PhysioNetXGBRisk",
     "EnsembleRisk",
+    "ModelUnavailableError",
+    "model_identity",
     "StubRisk",
     "load_default_risk_model",
+    "load_risk_model",
     "FEATURE_LABELS",
     "PHYSIONET_FEATURE_COLUMNS",
 ]
